@@ -3,6 +3,7 @@ package concurrentpaymentledger
 import (
 	"context"
 	"errors"
+	"sync"
 )
 
 type Transfer struct {
@@ -26,6 +27,7 @@ type Ledger interface {
 type LedgerRepository struct {
 	accounts           map[string]*Account
 	transactionHistory map[string]*TransferResult
+	mu                 sync.Mutex
 }
 
 func NewLedgerRepo() *LedgerRepository {
@@ -48,59 +50,81 @@ func (l *LedgerRepository) CheckAccount(accountId string) bool {
 	return exists
 }
 
-func (l *LedgerRepository) ValidateTransaction(transactionId string) bool {
+func (l *LedgerRepository) StartTransaction(transactionId string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	_, exist := l.transactionHistory[transactionId]
-	return exist
+	if exist {
+		return false
+	}
+	l.transactionHistory[transactionId] = &TransferResult{
+		ID:     transactionId,
+		Status: "IN_PROGRESS",
+		Reason: "",
+	}
+	return true
 }
 
 func (l *LedgerRepository) RegisterTransaction(transaction *TransferResult) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.transactionHistory[transaction.ID] = transaction
 }
 
 func (l *LedgerRepository) ProcessBatch(ctx context.Context, transfers []Transfer, workers int) []TransferResult {
 	workerPool := New[TransferResult](workers, 10)
-	defer workerPool.Shutdown()
+	go func() {
+		for idx, transfer := range transfers {
+			excuteFunc := func(ctx context.Context) (TransferResult, error) {
+				to := transfer.To
+				from := transfer.From
+				result := TransferResult{
+					ID:     transfer.ID,
+					Status: "IN_PROGRESS",
+					Reason: "",
+				}
+				var err error
+				if to == from {
+					result.Status = "FAILED"
+					result.Reason = "Self transfer"
+					err = SelfTransferErr
+				} else if transfer.Amount <= 0 {
+					result.Status = "FAILED"
+					result.Reason = "Invalid amount"
+					err = InvalidAmountErr
+				} else if !l.CheckAccount(to) || !l.CheckAccount(from) {
+					result.Status = "FAILED"
+					result.Reason = "acount does not exists"
+					err = AccountDoesNotExistErr
+				} else if !l.StartTransaction(transfer.ID) {
+					result.Status = "FAILED"
+					result.Reason = "Duplicate transaction"
+					err = errors.New("Duplicate transaction")
+				} else {
+					toAccount, _ := l.accounts[to]
+					fromAccount, _ := l.accounts[from]
+					err = StartTransactionFullTransaction(toAccount, fromAccount, transfer.Amount)
+					if err != nil {
+						result.Status = "FAILED"
+						result.Reason = err.Error()
+					} else {
+						result.Status = "SUCCESS"
+					}
+				}
+				if err != nil && err.Error() == "Duplicate transaction" {
+					return result, err
+				} else {
+					l.RegisterTransaction(&result)
+				}
+				return result, err
 
-	for idx, transfer := range transfers {
-		excuteFunc := func(ctx context.Context) (TransferResult, error) {
-			to := transfer.To
-			from := transfer.From
-			if !l.CheckAccount(to) || l.CheckAccount(from) {
-				return TransferResult{
-					ID:     transfer.ID,
-					Status: "failed",
-					Reason: "acount does not exists",
-				}, AccountDoesNotExistErr
 			}
-			if l.ValidateTransaction(transfer.ID) {
-				return TransferResult{
-					ID:     transfer.ID,
-					Status: "failed",
-					Reason: "Duplicate transaction",
-				}, errors.New("Duplicate transaction")
-			}
-			toAccount, _ := l.accounts[to]
-			fromAccount, _ := l.accounts[from]
-			err := StartTransactionFullTransaction(toAccount, fromAccount, transfer.Amount)
-			if err != nil {
-				return TransferResult{
-					ID:     transfer.ID,
-					Status: "failed",
-					Reason: err.Error(),
-				}, err
-			}
-			result := TransferResult{
-				ID:     transfer.ID,
-				Status: "Success",
-				Reason: "success",
-			}
-			l.RegisterTransaction(&result)
-
-			return result, nil
+			job := Job[TransferResult]{ID: transfer.ID, Index: idx, Execute: excuteFunc}
+			workerPool.Submit(ctx, job)
 		}
-		job := Job[TransferResult]{ID: transfer.ID, Index: idx, Execute: excuteFunc}
-		workerPool.Submit(ctx, job)
-	}
+		workerPool.Shutdown()
+		close(workerPool.results)
+	}()
 	results := make([]TransferResult, len(transfers))
 	for result := range workerPool.results {
 		results[result.Index] = result.Value

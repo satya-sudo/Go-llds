@@ -14,6 +14,8 @@ const (
 
 var InSufficientBalanceErr = errors.New("Insufficent Balance")
 var AccountDoesNotExistErr = errors.New("Acount does not exists")
+var InvalidAmountErr = errors.New("Invalid amount in the transfer")
+var SelfTransferErr = errors.New("Self Transfer not allowed")
 
 type Account struct {
 	ID      string
